@@ -201,6 +201,7 @@ class wemo:
 
 def wemo_discover(interface):
     devices = ssdp_discover("urn:Belkin:device:**", interface, 1, 6)
+#    devices = ssdp_discover("upnp:rootdevice", interface, 1, 6)
 
     for d in devices:
         m = re.match("http://([^:]*):([0-9]*)/.*", d.location)
@@ -213,9 +214,9 @@ def wemo_discover(interface):
 
         try:
             name = wemo(ip, port).name()
-            print("{0} (port {1}): {2}".format(ip, port, name))
+            print("{0}:{1}: {2}".format(ip, port, name))
         except Exception as e:
-            print("{0} (port {1}): {2}".format(ip, port, str(e)))
+            print("{0}:{1}: {2}".format(ip, port, str(e)))
             pass
 
 
