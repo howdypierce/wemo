@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # Control a Wemo device on your local network.
 #
@@ -6,109 +6,218 @@
 #
 #
 
+# Poor man's test plan. Note 'Family Room Lights' is a real Wemo, and
+# 'Bedroom Light' is a Fauxmo
+#
+#   ~/Code/wemo $ ./wemo.py discover
+#   192.168.87.73:49915: Bedroom Light
+#   192.168.87.73:49925: Night Light
+#   192.168.87.73:49935: Bedroom Light Schedule
+#   192.168.87.67:49153: Family Room Lights
+#   192.168.87.134:49153: Kitchen Table
+#   192.168.87.68:49153: Garage Lights
+#   192.168.87.87:49153: Living Room Light
+#   ~/Code/wemo $ ./wemo.py 'Family Room Lights' on
+#   True
+#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 toggle
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 getstate
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 getfriendlyname
+#   Family Room Lights
+#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 getsignalstrength
+#   100
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 on
+#   True
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 off
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 off
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 toggle
+#   True
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 toggle
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 getstate
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 getfriendlyname
+#   Bedroom Light
+
 import re
 import requests
 import os
-import StringIO
 import socket
-import httplib
+import selectors
 import netifaces
 from time import sleep
 
 
-def ip_addresses():
-    "Return a list of the IPv4 addresses on all interfaces on this host"
+def interface_addrs(include_loopback: bool = False):
+    """Get the IPv4 addresses for all configured interfaces on this host.
+
+    Parameters
+    ----------
+    include_loopback
+      Should loopback address be included in returned list?
+
+    Returns
+    -------
+    Addresses are returned as a list of strings in dotted-decimal form.
+    """
+
     addrs = [netifaces.ifaddresses(i) for i in netifaces.interfaces()]
-    return [i['addr'] for a in addrs for i in a.get(netifaces.AF_INET, [])]
+    ret = [i['addr'] for a in addrs for i in a.get(netifaces.AF_INET, [])]
 
-###############################################################################
-#
-# The following is a modified version of:
-#     https://gist.github.com/dankrause/6000248
-#
-#   Copyright 2014 Dan Krause
-#
-#   Licensed under the Apache License, Version 2.0 (the "License");
-#   you may not use this file except in compliance with the License.
-#   You may obtain a copy of the License at
-#
-#       http://www.apache.org/licenses/LICENSE-2.0
-#
-#   Unless required by applicable law or agreed to in writing, software
-#   distributed under the License is distributed on an "AS IS" BASIS,
-#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#   See the License for the specific language governing permissions and
-#   limitations under the License.
+    if (not include_loopback):
+        return [i for i in ret if i != '127.0.0.1']
+    else:
+        return ret
 
 
-class SSDPResponse(object):
-    class _FakeSocket(StringIO.StringIO):
-        def makefile(self, *args, **kw):
-            return self
+class SSDPDevice(object):
+    """Utility class to represent a single SSDP endpoint"""
 
-    def __init__(self, response):
-        r = httplib.HTTPResponse(self._FakeSocket(response))
-        r.begin()
-        self.location = r.getheader("location")
-        self.usn = r.getheader("usn")
-        self.st = r.getheader("st")
-        self.cache = r.getheader("cache-control").split("=")[1]
+    @staticmethod
+    def _parse_hdr(hdr: str, raw: bytes) -> str:
+        """Parse the raw string for the given header, which is returned.
+        If the header cannot be found, returns None."""
+        try:
+            ret = re.findall(f"(?im)^{hdr}: ?(.+)\r$", raw.decode('utf-8'))[0]
+        except IndexError:
+            ret = None
+        return ret
+
+    def __init__(self, raw):
+        self.location = self._parse_hdr('location', raw)
+        self.usn = self._parse_hdr('usn', raw)
+        self.st = self._parse_hdr('st', raw)
+        m = re.match(r"(?a)https*://([^:]+):(\d+)/.*", self.location)
+        self.host = m.group(1) if m else ""
+        self.port = m.group(2) if m else ""
 
     def __repr__(self):
-        st = "<SSDPResponse({location}, {st}, {usn})>"
+        st = "<SSDPDevice({location}, {st}, {usn}, {host}, {port})>"
         return st.format(**self.__dict__)
 
 
-def ssdp_discover(service, interface, timeout=2, retries=1):
-    group = ("239.255.255.250", 1900)
+def ssdp_discover(ssdp_st: str,
+                  interfaces: list = None,
+                  timeout: int = 2,
+                  retries: int = 2):
+    """Discover local SSDP devices over IPv4.
+
+    Parameters
+    ----------
+    ssdp_st
+      The SSDP Search Target as specified in the UPnP spec. Some
+      values to try:
+             ssdp:all              - theoretically everything, although
+                Belkin Wemos don't respond to this (they should)
+             upnp:rootdevice       - all root devices
+             urn:Belkin:device:**  - all Wemos
+
+    interfaces
+      A list of interfaces to search. Default is to search all
+      interfaces available to this host, except loopback.
+
+    timeout
+      How long to wait, in seconds, for each attempt.
+
+    retries
+      How many times to try the search. Default is 2. Note that the
+      UPnP spec says ""Due to the unreliable nature of UDP, control
+      points should send each M-SEARCH message more than once.'
+
+    Unless an excpetion occurs, this function will return in
+      ((timeout+0.1) * retries) seconds.
+
+    Returns
+    -------
+    Returns a list of SSDPDevices
+    """
+
+    ipaddr = "239.255.255.250"
+    port = 1900
     message = "\r\n".join([
         'M-SEARCH * HTTP/1.1',
-        'HOST: {0}:{1}',
+        'HOST: {ip}:{port}',
         'MAN: "ssdp:discover"',
-        'ST: {st}', 'MX: {mx}', '', ''])
-    socket.setdefaulttimeout(timeout+1)
-    responses = {}
-    for _ in range(retries):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
-                             socket.IPPROTO_UDP)
-        sock.bind((interface, 0))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        sock.sendto(message.format(*group, st=service, mx=timeout), group)
-        while True:
-            try:
-                response = SSDPResponse(sock.recv(1024))
-                responses[response.location] = response
-            except socket.timeout:
-                break
-        if responses:
-            break
+        'MX: {mx}',
+        'ST: {st}',
+        '',
+        '']).format(ip=ipaddr, port=port, st=ssdp_st, mx=timeout)
+    if interfaces is None:
+        interfaces = interface_addrs()
 
-    return responses.values()
-###############################################################################
-# end Dan Krause library
-###############################################################################
+    devices = {}
+    for _ in range(retries):
+        sel = selectors.DefaultSelector()
+        for intf in interfaces:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                 socket.IPPROTO_UDP)
+            sock.bind((intf, 0))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.sendto(message.encode('utf-8'), (ipaddr, port))
+            sock.setblocking(False)
+            sel.register(sock, selectors.EVENT_READ)
+
+        events = [None]
+        while events:
+            events = sel.select(timeout+0.1)
+            for key, mask in events:
+                dev = SSDPDevice(key.fileobj.recv(1024))
+                devices[dev.usn] = dev
+
+    return devices.values()
 
 
 ###############################################################################
 #
-# The following Wemo SOAP command set stuff is a modified version of:
+# The following Wemo class is a modified version of:
 #     https://gist.github.com/pruppert/af7d38cb7b7ca75584ef
 
-class wemo:
-    OFF_STATE = '0'
-    ON_STATES = ['1', '8']
+class Wemo(object):
+    """Control a Belkin Wemo device over the network.
+
+    Also works with Fauxmo devices (https://github.com/n8henrie/fauxmo)
+    """
+
     ip = None
     port = None
     _cached_name = None
     _num_retries = 3             # retry wemo commands this many times
 
-    def __init__(self, ip, port=None):
+    def __init__(self, ip: str, port: int = None):
+        """Initialize a Wemo instance.
+
+        Parameters
+        ----------
+        ip
+          The IP address of the Wemo
+        port
+          The port to use to control the Wemo. Optional; if not
+          specified, the class will search the normal set of Belkin
+          ports.
+
+        """
         self.ip = ip
         self.port = port
 
-    def do(self, action_in):
-        action = action_in.lower()
+    def do(self, action: str):
+        """Perform one of the specified actions on the Wemo.
+        Parameters
+        ----------
+        action
+          One of 'on', 'off', 'toggle', 'getstate' or 'state',
+          'getsignalstrength' or 'signalstrength', 'getfriendlyname'
+          or 'getname'
+
+        Returns
+        -------
+        Returns the value from calling the corresponding function.
+
+        """
+        action = action.lower()
 
         if action == "on":
             result = self.on()
@@ -117,7 +226,7 @@ class wemo:
         elif action == "toggle":
             result = self.toggle()
         elif action == "getstate" or action == "state":
-            result = self.status()
+            result = self.get_state()
         elif action == "getsignalstrength" or action == "signalstrength":
             result = self.signal()
         elif action == "getfriendlyname" or action == "getname":
@@ -128,36 +237,69 @@ class wemo:
         return result
 
     def toggle(self):
-        status = self.status()
-        if status in self.ON_STATES:
-            result = self.off()
-            result = 'Wemo is now off.'
-        elif status == self.OFF_STATE:
-            result = self.on()
-            result = 'Wemo is now on.'
-        else:
-            raise Exception("UnexpectedStatusResponse")
-        return result
+        """Toggle the state of the Wemo.
+
+        Returns
+        -------
+        If the command was successful, returns True or False,
+        representing the new state of the Wemo.
+
+        """
+        return self.set_state(not self.get_state())
 
     def on(self):
-        return self._send('Set', 'BinaryState', 1)
+        """Turn the Wemo on."""
+        return self.set_state(True)
 
     def off(self):
-        return self._send('Set', 'BinaryState', 0)
+        """Turn the Wemo off."""
+        return self.set_state(False)
 
-    def status(self):
-        return self._send('Get', 'BinaryState')
+    @staticmethod
+    def _state_to_bool(val: str):
+        """Convert Wemo status string to Python bool.
+
+        A Wemo returns its status as an integer string, either '1' or
+        '8' for on, and '0' for off. Convert that to True/False.
+        """
+        if val in ['1', '8']:
+            return True
+        elif val == '0':
+            return False
+        else:
+            raise Exception(f"UnexpectedStatusResponse: {val}")
+
+    def set_state(self, state: bool):
+        """Turn the Wemo to the indicated state."""
+        if state:
+            val = 1
+        else:
+            val = 0
+        return self._state_to_bool(self._send('Set', 'BinaryState', val))
+
+    def get_state(self):
+        """Get the Wemo's current state, on or off.
+
+        Returns
+        -------
+        If the command was successul, returns a boolean representing
+        the current state of the Wemo.
+
+        """
+        return self._state_to_bool(self._send('Get', 'BinaryState'))
 
     def name(self):
+        """Get the friendly name of the Wemo."""
         if not self._cached_name:
             self._cached_name = self._send('Get', 'FriendlyName')
         return self._cached_name
 
     def signal(self):
+        """Get the signal strength of the Wemo."""
         return self._send('Get', 'SignalStrength')
 
     def _get_header_xml(self, method, obj):
-        return '"urn:Belkin:service:basicevent:1#{}{}"'.format(method, obj)
+        return f'"urn:Belkin:service:basicevent:1#{method}{obj}"'
 
     def _get_body_xml(self, method, obj, value=0):
         return ('<u:{0}{1} xmlns:u="urn:Belkin:service:basicevent:1"><{1}>'
@@ -178,11 +320,11 @@ class wemo:
                 if result is not None:
                     self.port = port
                     return result
-            sleep(0.2)
-        raise Exception("Timeout on all ports: {0}".format(self.ports))
+                sleep(0.2)
+        raise Exception(f"Timeout on all ports: {self.ports}")
 
     def _try_send(self, ip, port, body, header, data):
-        url = 'http://{0}:{1}/upnp/control/basicevent1'.format(ip, port)
+        url = f'http://{ip}:{port}/upnp/control/basicevent1'
         hdrs = {'Content-type': 'text/xml; charset="utf-8"',
                 'SOAPACTION': header}
         request_body = (
@@ -190,31 +332,25 @@ class wemo:
             '<s:Envelope '
             'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
             's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-            '<s:Body>{0}</s:Body></s:Envelope>'
+            f'<s:Body>{body}</s:Body></s:Envelope>'
         )
-        r = requests.post(url, headers=hdrs, data=request_body.format(body),
-                          timeout=3.0)
-        return self._extract(r.content, data)
-
-    def _extract(self, response, name):
-        exp = '<%s>(.*?)<\/%s>' % (name, name)
-        g = re.search(exp, response)
-        if g:
-            return g.group(1)
-        return response
+        r = requests.post(url, headers=hdrs, data=request_body, timeout=3.0)
+        exp = f"<{data}>(.*?)</{data}>"
+        g = re.search(exp, r.content.decode('utf-8'))
+        return g.group(1) if g else ""
 
 ###############################################################################
 # end Wemo SOAP
 ###############################################################################
 
 
-def find_wemos(interface=None, search=None):
+def find_wemos(interfaces=None, search=None):
     """Find Wemos on the network.
 
     Parameters
     ----------
-    interface
-       The interface on which to perform discovery. If not specified,
+    interfaces
+       A list of interfaces on which to perform discovery. If not specified,
        all non-loopback IPv4 interfaces will be used
     search
        If specified, the list of returned devices will be limited to those
@@ -226,34 +362,16 @@ def find_wemos(interface=None, search=None):
     """
 
     wemo_search_string = "urn:Belkin:device:**"
-    if search:
-        search = search.lower().strip()
-
-    if not interface:
-        interfaces = [i for i in ip_addresses() if i != '127.0.0.1']
-    else:
-        interfaces = [interface]
-
-    devices = []
-    for intf in interfaces:
-        devices.extend(ssdp_discover(wemo_search_string, intf, 1, 6))
+    devices = ssdp_discover(wemo_search_string, interfaces)
 
     rl = []
     for d in devices:
-        m = re.match("http://([^:]*):([0-9]*)/.*", d.location)
-
-        if not m:
-            continue
-
-        ip = m.group(1)
-        port = m.group(2)
-
         try:
-            wm = wemo(ip, port)
-        except Exception as e:
+            wm = Wemo(d.host, d.port)
+        except Exception:
             continue
 
-        if search and wm.name().lower().strip() != search:
+        if search and wm.name().lower().strip() != search.lower().strip():
             continue
 
         rl.append(wm)
@@ -261,10 +379,10 @@ def find_wemos(interface=None, search=None):
     return rl
 
 
-def wemo_discover(interface=None):
-    "Print all Wemos found on the network"
-    for wm in find_wemos(interface):
-        print("{}:{}: {}".format(wm.ip, wm.port, wm.name()))
+def wemo_discover(interfaces=None):
+    """Print the IP address, port, and friendly name for all Wemos found."""
+    for wm in find_wemos(interfaces):
+        print(f"{wm.ip}:{wm.port}: {wm.name()}")
 
 
 if __name__ == '__main__':
@@ -302,17 +420,20 @@ if __name__ == '__main__':
         if len(sys.argv) == 2:
             wemo_discover()
         elif len(sys.argv) == 3:
-            wemo_discover(sys.argv[2])
+            wemo_discover([sys.argv[2]])
         else:
             usage()
         sys.exit(0)
 
-    action = sys.argv[2].lower()
-    if action not in [a.lower() for a in actions]:
-        print("Incorrect action: {0}".format(action))
+    if len(sys.argv) != 3:
         usage()
 
-    m = re.match("(\d+\.\d+\.\d+\.\d+)(:[0-9]+)?$", sys.argv[1])
+    action = sys.argv[2].lower()
+    if action not in [a.lower() for a in actions]:
+        print(f"Incorrect action: {action}")
+        usage()
+
+    m = re.match(r"(\d+\.\d+\.\d+\.\d+)(:[0-9]+)?$", sys.argv[1])
     if m:
         # User specified IP & port
         ip = m.group(1)
@@ -320,22 +441,23 @@ if __name__ == '__main__':
         if port:
             port = port[1:]
 
-        switch = wemo(ip, port)
-        try:
-            print(switch.do(action))
-        except Exception as e:
-            sys.stderr.write("wemo {} {}: {}\n".format(ip, action, e))
-            sys.exit(1)
+        switch = Wemo(ip, port)
+#        try:
+        print(switch.do(action))
+#        except Exception as e:
+#            sys.stderr.write(f"wemo {ip} {action}: {e}\n")
+#            sys.exit(1)
         sys.exit(0)
 
     # If we're here, user specified wemo by name, so find it
     wemos = find_wemos(search=sys.argv[1])
     if len(wemos) == 0:
-        sys.stderr.write("wemo {} not found\n".format(sys.argv[1]))
+        sys.stderr.write(f"wemo {sys.argv[1]} not found\n")
+        sys.exit(1)
 
     for wm in wemos:
         try:
             print(wm.do(action))
         except Exception as e:
-            sys.stderr.write("wemo {}: %s\n".format(wm.name(), e))
+            sys.stderr.write(f"wemo {wm.name()}: {e}\n")
             sys.exit(1)
