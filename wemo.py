@@ -4,10 +4,10 @@
 #
 # Howdy Pierce, howdy@cardinalpeak.com
 #
-#
 
-# Poor man's test plan. Note 'Family Room Lights' is a real Wemo, and
-# 'Bedroom Light' is a Fauxmo
+
+# Poor man's test plan. Note 'Family Room Lights' and 'Garage Lights'
+# are real Belkin Wemos, and 'Bedroom Light' is a Fauxmo
 #
 #   ~/Code/wemo $ ./wemo.py discover
 #   192.168.87.73:49915: Bedroom Light
@@ -41,6 +41,17 @@
 #   False
 #   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 getfriendlyname
 #   Bedroom Light
+#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49000 getfriendlyname  # wrong port
+#   wemo 192.168.87.73 getstate: Timeout on ports ['49000']
+#   ~/Code/wemo $ ./wemo.py 192.168.87.68 on   # automatic port finding
+#   True
+#   ~/Code/wemo $ ./wemo.py 192.168.87.68 off
+#   False
+#   ~/Code/wemo $ ./wemo.py 192.168.87.63 on   # non-responsive IP
+#   wemo 192.168.87.63 on: Timeout on ports [49153, 49152, 49154, 49151, 49155]
+#   ~/Code/wemo $ ./wemo.py Fred on
+#   wemo Fred: Unable to find Wemo by name Fred
+
 
 import re
 import requests
@@ -49,6 +60,7 @@ import socket
 import selectors
 import netifaces
 from time import sleep
+import sys
 
 
 def interface_addrs(include_loopback: bool = False):
@@ -168,40 +180,46 @@ def ssdp_discover(ssdp_st: str,
                 dev = SSDPDevice(key.fileobj.recv(1024))
                 devices[dev.usn] = dev
 
-    return devices.values()
+    return list(devices.values())
 
 
-###############################################################################
-#
-# The following Wemo class is a modified version of:
+# The following Wemo class is a heavily modified version of:
 #     https://gist.github.com/pruppert/af7d38cb7b7ca75584ef
-
 class Wemo(object):
     """Control a Belkin Wemo device over the network.
 
     Also works with Fauxmo devices (https://github.com/n8henrie/fauxmo)
     """
-
     ip = None
     port = None
-    _cached_name = None
-    _num_retries = 3             # retry wemo commands this many times
+    name = None
 
-    def __init__(self, ip: str, port: int = None):
+    def __init__(self,
+                 ip: str = None,
+                 port: int = None,
+                 name: str = None):
         """Initialize a Wemo instance.
 
         Parameters
         ----------
         ip
-          The IP address of the Wemo
+          The IP address of the Wemo. Optional, see below.
         port
           The port to use to control the Wemo. Optional; if not
           specified, the class will search the normal set of Belkin
           ports.
+        name
+          The friendly name of the Wemo. If specified, the class will
+          attempt to perform network discovery to find a Wemo with the
+          specified name.
 
+        Caller must specify exactly one of IP or name.
         """
+        if (ip is None and name is None):
+            raise ValueError("Must specify either IP or name")
         self.ip = ip
         self.port = port
+        self.name = name
 
     def do(self, action: str):
         """Perform one of the specified actions on the Wemo.
@@ -220,17 +238,17 @@ class Wemo(object):
         action = action.lower()
 
         if action == "on":
-            result = self.on()
+            result = self.set_state(True)
         elif action == "off":
-            result = self.off()
+            result = self.set_state(False)
         elif action == "toggle":
             result = self.toggle()
         elif action == "getstate" or action == "state":
             result = self.get_state()
         elif action == "getsignalstrength" or action == "signalstrength":
-            result = self.signal()
+            result = self.get_signal_strength()
         elif action == "getfriendlyname" or action == "getname":
-            result = self.name()
+            result = self.get_name()
         else:
             raise Exception("Unknown action %s" % action)
 
@@ -246,14 +264,6 @@ class Wemo(object):
 
         """
         return self.set_state(not self.get_state())
-
-    def on(self):
-        """Turn the Wemo on."""
-        return self.set_state(True)
-
-    def off(self):
-        """Turn the Wemo off."""
-        return self.set_state(False)
 
     @staticmethod
     def _state_to_bool(val: str):
@@ -275,7 +285,14 @@ class Wemo(object):
             val = 1
         else:
             val = 0
-        return self._state_to_bool(self._send('Set', 'BinaryState', val))
+        res = self._send('Set', 'BinaryState', val)
+        # If the Wemo was already in the requested state, it returns
+        # the string "Error". Way to ruin a nice idempotent function,
+        # guys! If we get this string, just substitute what the Wemo
+        # _should_ have sent!
+        if res == 'Error':
+            res = str(val)
+        return self._state_to_bool(res)
 
     def get_state(self):
         """Get the Wemo's current state, on or off.
@@ -288,13 +305,13 @@ class Wemo(object):
         """
         return self._state_to_bool(self._send('Get', 'BinaryState'))
 
-    def name(self):
+    def get_name(self):
         """Get the friendly name of the Wemo."""
-        if not self._cached_name:
-            self._cached_name = self._send('Get', 'FriendlyName')
-        return self._cached_name
+        if not self.name:
+            self.name = self._send('Get', 'FriendlyName')
+        return self.name
 
-    def signal(self):
+    def get_signal_strength(self):
         """Get the signal strength of the Wemo."""
         return self._send('Get', 'SignalStrength')
 
@@ -306,42 +323,51 @@ class Wemo(object):
                 '{2}</{1}></u:{0}{1}>').format(method, obj, value)
 
     def _send(self, method, obj, value=None):
-        body_xml = self._get_body_xml(method, obj, value)
-        header_xml = self._get_header_xml(method, obj)
-        # if port not known, search the default Wemo ports
-        if self.port:
-            ports = [self.port]
-        else:
-            ports = [49153, 49152, 49154, 49151, 49155]
-        for _ in range(self._num_retries):
-            for port in ports:
-                result = self._try_send(self.ip, port, body_xml, header_xml,
-                                        obj)
-                if result is not None:
-                    self.port = port
-                    return result
-                sleep(0.2)
-        raise Exception(f"Timeout on all ports: {self.ports}")
-
-    def _try_send(self, ip, port, body, header, data):
-        url = f'http://{ip}:{port}/upnp/control/basicevent1'
-        hdrs = {'Content-type': 'text/xml; charset="utf-8"',
-                'SOAPACTION': header}
-        request_body = (
+        headers = {'Content-type': 'text/xml; charset="utf-8"',
+                   'SOAPACTION': self._get_header_xml(method, obj)}
+        body = (
             '<?xml version="1.0" encoding="utf-8"?>'
             '<s:Envelope '
             'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
             's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-            f'<s:Body>{body}</s:Body></s:Envelope>'
-        )
-        r = requests.post(url, headers=hdrs, data=request_body, timeout=3.0)
-        exp = f"<{data}>(.*?)</{data}>"
-        g = re.search(exp, r.content.decode('utf-8'))
+            '<s:Body>{}</s:Body></s:Envelope>'
+        ).format(self._get_body_xml(method, obj, value))
+
+        result = self._try_send(headers, body)
+        g = re.search(f"<{obj}>(.*?)</{obj}>", result)
         return g.group(1) if g else ""
 
-###############################################################################
-# end Wemo SOAP
-###############################################################################
+    def _attempt_discovery(self):
+        """Attempt discovery by name. Raise exception if not found."""
+        if self.name is None:
+            raise Exception("Can't discover with unknown name")
+        w_list = find_wemos(search=self.name)
+        if not w_list:
+            raise Exception(f"Unable to find Wemo by name {self.name}")
+        self.ip = w_list[0].ip
+        self.port = w_list[0].port
+
+    def _try_send(self, headers, body):
+        if self.ip is None:
+            self._attempt_discovery()
+        if self.port:
+            ports = [self.port]
+        else:
+            ports = [49153, 49152, 49154, 49151, 49155]
+        for p in ports:
+            url = f'http://{self.ip}:{p}/upnp/control/basicevent1'
+            try:
+                r = requests.post(url, headers=headers, data=body, timeout=3.0)
+                return r.content.decode('utf-8')
+            except (requests.ConnectTimeout, requests.ConnectionError) as e:
+                if ("Errno 64" in f"{e}" and self.name):
+                    # host is down - reset IP (to force discovery) and retry
+                    self.ip = None
+                    return self._try_send(headers, body)
+                else:
+                    pass
+            sleep(0.2)
+        raise Exception(f"Timeout on ports {ports}")
 
 
 def find_wemos(interfaces=None, search=None):
@@ -362,32 +388,51 @@ def find_wemos(interfaces=None, search=None):
     """
 
     wemo_search_string = "urn:Belkin:device:**"
-    devices = ssdp_discover(wemo_search_string, interfaces)
 
-    rl = []
-    for d in devices:
-        try:
-            wm = Wemo(d.host, d.port)
-        except Exception:
-            continue
+    # If we're looking for a particular Wemo, it makes sense to
+    # iterate more times over shorter calls to ssdp_discover, because
+    # as soon as we find the Wemo we're looking for, we can exit the
+    # search. If, on the other hand, we are doing a general discovery
+    # and not looking for a particular Wemo, we should make only one
+    # call to ssdp_discover, but allow that call to have a relatively
+    # longer timeout and number of retries.
+    if search:
+        search = search.lower().strip()
+        search_strategy = [(1, 1), (1, 1), (3, 1)]
+    else:
+        search_strategy = [(2, 3)]
 
-        if search and wm.name().lower().strip() != search.lower().strip():
-            continue
+    rl = {}
+    for t_out, retry in search_strategy:
+        devices = ssdp_discover(wemo_search_string, interfaces, t_out, retry)
 
-        rl.append(wm)
+        for d in devices:
+            if (d.host, d.port) in rl:
+                continue
 
-    return rl
+            try:
+                wm = Wemo(d.host, d.port)
+            except Exception:
+                continue
+
+            if search and wm.get_name().lower().strip() != search:
+                continue
+
+            rl[(d.host, d.port)] = wm
+
+        if search and rl:
+            break
+
+    return list(rl.values())
 
 
 def wemo_discover(interfaces=None):
     """Print the IP address, port, and friendly name for all Wemos found."""
     for wm in find_wemos(interfaces):
-        print(f"{wm.ip}:{wm.port}: {wm.name()}")
+        print(f"{wm.ip}:{wm.port}: {wm.get_name()}")
 
 
 if __name__ == '__main__':
-    import sys
-
     actions = ['On',
                'Off',
                'GetState',
@@ -440,24 +485,15 @@ if __name__ == '__main__':
         port = m.group(2)
         if port:
             port = port[1:]
-
         switch = Wemo(ip, port)
-#        try:
-        print(switch.do(action))
-#        except Exception as e:
-#            sys.stderr.write(f"wemo {ip} {action}: {e}\n")
-#            sys.exit(1)
-        sys.exit(0)
+    else:
+        # User specified wemo by name
+        switch = Wemo(name=sys.argv[1])
 
-    # If we're here, user specified wemo by name, so find it
-    wemos = find_wemos(search=sys.argv[1])
-    if len(wemos) == 0:
-        sys.stderr.write(f"wemo {sys.argv[1]} not found\n")
+    try:
+        print(switch.do(action))
+    except Exception as e:
+        sys.stderr.write(f"wemo {sys.argv[1]}: {e}\n")
         sys.exit(1)
 
-    for wm in wemos:
-        try:
-            print(wm.do(action))
-        except Exception as e:
-            sys.stderr.write(f"wemo {wm.name()}: {e}\n")
-            sys.exit(1)
+    sys.exit(0)
