@@ -5,54 +5,6 @@
 # Howdy Pierce, howdy@cardinalpeak.com
 #
 
-
-# Poor man's test plan. Note 'Family Room Lights' and 'Garage Lights'
-# are real Belkin Wemos, and 'Bedroom Light' is a Fauxmo
-#
-#   ~/Code/wemo $ ./wemo.py discover
-#   192.168.87.73:49915: Bedroom Light
-#   192.168.87.73:49925: Night Light
-#   192.168.87.73:49935: Bedroom Light Schedule
-#   192.168.87.67:49153: Family Room Lights
-#   192.168.87.134:49153: Kitchen Table
-#   192.168.87.68:49153: Garage Lights
-#   192.168.87.87:49153: Living Room Light
-#   ~/Code/wemo $ ./wemo.py 'Family Room Lights' on
-#   True
-#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 toggle
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 getstate
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 getfriendlyname
-#   Family Room Lights
-#   ~/Code/wemo $ ./wemo.py 192.168.87.67:49153 getsignalstrength
-#   100
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 on
-#   True
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 off
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 off
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 toggle
-#   True
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 toggle
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 getstate
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49915 getfriendlyname
-#   Bedroom Light
-#   ~/Code/wemo $ ./wemo.py 192.168.87.73:49000 getfriendlyname  # wrong port
-#   wemo 192.168.87.73 getstate: Timeout on ports ['49000']
-#   ~/Code/wemo $ ./wemo.py 192.168.87.68 on   # automatic port finding
-#   True
-#   ~/Code/wemo $ ./wemo.py 192.168.87.68 off
-#   False
-#   ~/Code/wemo $ ./wemo.py 192.168.87.63 on   # non-responsive IP
-#   wemo 192.168.87.63 on: Timeout on ports [49153, 49152, 49154, 49151, 49155]
-#   ~/Code/wemo $ ./wemo.py Fred on
-#   wemo Fred: Unable to find Wemo by name Fred
-
-
 import re
 import requests
 import os
@@ -123,7 +75,7 @@ def ssdp_discover(ssdp_st: str,
       The SSDP Search Target as specified in the UPnP spec. Some
       values to try:
              ssdp:all              - theoretically everything, although
-                Belkin Wemos don't respond to this (they should)
+                Belkin Wemos don't respond to this (they should, per UPnP)
              upnp:rootdevice       - all root devices
              urn:Belkin:device:**  - all Wemos
 
@@ -213,12 +165,12 @@ class Wemo(object):
           attempt to perform network discovery to find a Wemo with the
           specified name.
 
-        Caller must specify exactly one of IP or name.
+        Caller must specify either IP or name.
         """
         if (ip is None and name is None):
             raise ValueError("Must specify either IP or name")
         self.ip = ip
-        self.port = port
+        self.port = int(port) if port is not None else port
         self.name = name
 
     def do(self, action: str):
@@ -313,7 +265,7 @@ class Wemo(object):
 
     def get_signal_strength(self):
         """Get the signal strength of the Wemo."""
-        return self._send('Get', 'SignalStrength')
+        return int(self._send('Get', 'SignalStrength'))
 
     def _get_header_xml(self, method, obj):
         return f'"urn:Belkin:service:basicevent:1#{method}{obj}"'
@@ -341,11 +293,11 @@ class Wemo(object):
         """Attempt discovery by name. Raise exception if not found."""
         if self.name is None:
             raise Exception("Can't discover with unknown name")
-        w_list = find_wemos(search=self.name)
+        w_list = find_wemos(self.name)
         if not w_list:
             raise Exception(f"Unable to find Wemo by name {self.name}")
         self.ip = w_list[0].ip
-        self.port = w_list[0].port
+        self.port = int(w_list[0].port)
 
     def _try_send(self, headers, body):
         if self.ip is None:
@@ -370,17 +322,17 @@ class Wemo(object):
         raise Exception(f"Timeout on ports {ports}")
 
 
-def find_wemos(interfaces=None, search=None):
+def find_wemos(search=None, interfaces=None):
     """Find Wemos on the network.
 
     Parameters
     ----------
-    interfaces
-       A list of interfaces on which to perform discovery. If not specified,
-       all non-loopback IPv4 interfaces will be used
     search
        If specified, the list of returned devices will be limited to those
        whose friendly-names match this string
+    interfaces
+       A list of interfaces on which to perform discovery. If not specified,
+       all non-loopback IPv4 interfaces will be used
 
     Returns
     -------
@@ -428,7 +380,7 @@ def find_wemos(interfaces=None, search=None):
 
 def wemo_discover(interfaces=None):
     """Print the IP address, port, and friendly name for all Wemos found."""
-    for wm in find_wemos(interfaces):
+    for wm in find_wemos(interfaces=interfaces):
         print(f"{wm.ip}:{wm.port}: {wm.get_name()}")
 
 
@@ -459,6 +411,9 @@ if __name__ == '__main__':
 
     if len(sys.argv) < 2 or len(sys.argv) > 3:
         print("Incorrect number of arguments!")
+        usage()
+
+    if sys.argv[1].lower() in ["help", "--help"]:
         usage()
 
     if sys.argv[1].lower() == 'discover':
