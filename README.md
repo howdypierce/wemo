@@ -1,8 +1,10 @@
 # wemo.py
 
-Wemo is a Python client class to control the state of Belkin Wemo
-devices on the local network. It also works with any device that
-mimics a Wemo, such as a (Fauxmo)[https://github.com/n8henrie/fauxmo]
+Wemo is a command-line utility and Python client class to control the
+state of Belkin Wemo devices on the local network. It also works with
+any device that mimics a Wemo, such as a
+[Fauxmo](https://github.com/n8henrie/fauxmo). Wemo depends on Python
+3.6 or later.
 
 ## Command-line use
 
